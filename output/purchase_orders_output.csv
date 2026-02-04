@@ -1,4 +1,3 @@
-Source File,PO Number,Date,Vendor Name,Total Amount,Number of Items
-test1.png,002,"Jun 22, 2021",,1564.0,4
-test2.webp,8873632,10/01/2021,,1075.0,5
-test3.jpg,,,,,2
+Source File,PO Number,Date,Vendor Name,Product Description,Quantity
+originalPO.jpg,SW02132230W,2026-01-26,CRYSTAL MARTIN (HONG KONG)LTD,VS Panty Global Heat Transfer C/70 - Cold Peel (Angel Pink),1319
+test.jpg,4165,,,,0
