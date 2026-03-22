@@ -43,6 +43,23 @@ SCOPES = [
 ]
 
 
+def get_auth_config_issues() -> list:
+    """Return a list of missing OAuth configuration fields."""
+    issues = []
+    if not CLIENT_ID or CLIENT_ID.strip() in {"", "YOUR_CLIENT_ID_HERE"}:
+        issues.append("AZURE_CLIENT_ID")
+    if not CLIENT_SECRET or CLIENT_SECRET.strip() in {"", "YOUR_CLIENT_SECRET_HERE"}:
+        issues.append("AZURE_CLIENT_SECRET")
+    if not REDIRECT_URI or not REDIRECT_URI.strip():
+        issues.append("REDIRECT_URI")
+    return issues
+
+
+def is_auth_configured() -> bool:
+    """Check whether required OAuth config values are present."""
+    return len(get_auth_config_issues()) == 0
+
+
 def get_auth_url() -> str:
     """
     Generate the Microsoft OAuth2 authorization URL.
@@ -51,6 +68,9 @@ def get_auth_url() -> str:
     Returns:
         Authorization URL string
     """
+    if not is_auth_configured():
+        return ""
+
     params = {
         "client_id": CLIENT_ID,
         "response_type": "code",

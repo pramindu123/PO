@@ -26,7 +26,7 @@ A Streamlit web application that connects to your Outlook inbox via Microsoft Gr
      - "Accounts in any organizational directory and personal Microsoft accounts" - for both work and personal
    - **Redirect URI**: 
      - Platform: **Web**
-     - URI: `http://localhost:8501`
+     - URI: `http://localhost:8502`
 5. Click **Register**
 
 ### 2. Configure API Permissions
@@ -49,15 +49,24 @@ A Streamlit web application that connects to your Outlook inbox via Microsoft Gr
 
 ### 4. Configure the Application
 
-Option A: **Environment Variables** (Recommended for security)
+Option A: **Create `streamlit_app/.env`** (Recommended)
 ```bash
-set OUTLOOK_CLIENT_ID=your_client_id_here
-set OUTLOOK_CLIENT_SECRET=your_client_secret_here
-set OUTLOOK_REDIRECT_URI=http://localhost:8501
+AZURE_CLIENT_ID=your_client_id_here
+AZURE_CLIENT_SECRET=your_client_secret_here
+AZURE_REDIRECT_URI=http://localhost:8502
+AZURE_TENANT_ID=common
 ```
 
-Option B: **Edit config.py**
-Update the values in `config.py`:
+Option B: **Environment Variables (Windows PowerShell)**
+```powershell
+$env:AZURE_CLIENT_ID="your_client_id_here"
+$env:AZURE_CLIENT_SECRET="your_client_secret_here"
+$env:AZURE_REDIRECT_URI="http://localhost:8502"
+$env:AZURE_TENANT_ID="common"
+```
+
+Option C: **Edit config.py directly**
+Update the values or defaults in `config.py`:
 ```python
 CLIENT_ID = "your_client_id_here"
 CLIENT_SECRET = "your_client_secret_here"
@@ -81,6 +90,7 @@ streamlit run app.py
 ```
 
 The app will open at `http://localhost:8501`
+The app will open at `http://localhost:8502` (if started with `--server.port 8502`).
 
 ## Usage
 
@@ -97,7 +107,7 @@ The app will open at `http://localhost:8501`
 
 ### "Token exchange error"
 - Make sure your Client ID and Client Secret are correct
-- Verify the redirect URI matches exactly (http://localhost:8501)
+- Verify the redirect URI matches exactly (http://localhost:8502)
 - Check that you copied the complete authorization code
 
 ### "No emails found"
@@ -110,6 +120,7 @@ The app will open at `http://localhost:8501`
 
 ### "AADSTS error codes"
 - AADSTS50011: Redirect URI mismatch - update in Azure AD
+- AADSTS900144: Missing `client_id` - set `AZURE_CLIENT_ID` in `streamlit_app/.env` or env vars
 - AADSTS7000215: Invalid client secret - create a new one
 - AADSTS65001: Consent required - grant admin consent or login as user to consent
 

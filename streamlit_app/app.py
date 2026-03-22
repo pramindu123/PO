@@ -13,7 +13,13 @@ GRAPH_API_ENDPOINT = "https://graph.microsoft.com/v1.0"
 PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 
 # Import authentication module
-from auth import get_auth_url, get_token_from_code, refresh_access_token
+from auth import (
+    get_auth_url,
+    get_token_from_code,
+    refresh_access_token,
+    get_auth_config_issues,
+    is_auth_configured,
+)
 
 # Import BERT classifier (optional - falls back to rules if not available)
 try:
@@ -203,6 +209,48 @@ def extract_item_codes(text):
     return list(set(items))
 
 
+def extract_supplier_name_from_email_body(text):
+    """Extract supplier/vendor name from plain email body text."""
+    if not text:
+        return None
+
+    normalized_text = re.sub(r'\r\n?', '\n', str(text))
+
+    # Label-based patterns are most reliable in email bodies.
+    patterns = [
+        r'(?im)^\s*(?:supplier|vendor|seller|manufacturer|from company|company|supplier name|vendor name)\s*[:\-]\s*([^\n]{2,120})',
+        r'(?im)^\s*dear\s+([A-Za-z][A-Za-z0-9&.,\'()\-\s]{1,80})\s*[,!]',
+    ]
+
+    def _clean_supplier(candidate):
+        candidate = re.sub(r'\s+', ' ', candidate).strip(" \t\r\n-:;,.")
+        candidate = re.sub(r'\b(?:thanks|thank you|regards|best regards|sincerely)\b.*$', '', candidate, flags=re.IGNORECASE).strip()
+        # Skip obvious non-name fragments.
+        if len(candidate) < 3:
+            return None
+        if any(token in candidate.lower() for token in ['@', 'http://', 'https://']):
+            return None
+        return candidate[:120]
+
+    for pattern in patterns:
+        match = re.search(pattern, normalized_text)
+        if match:
+            cleaned = _clean_supplier(match.group(1))
+            if cleaned:
+                return cleaned
+
+    # Fallback: look for signatures like "ACME LTD" in the last lines.
+    tail_lines = [ln.strip() for ln in normalized_text.split('\n')[-8:] if ln.strip()]
+    company_suffix_pattern = r'\b(?:LTD|LIMITED|LLC|INC|CORP|CO\.?|PVT\.?\s*LTD)\b'
+    for line in tail_lines:
+        if re.search(company_suffix_pattern, line, re.IGNORECASE):
+            cleaned = _clean_supplier(line)
+            if cleaned:
+                return cleaned
+
+    return None
+
+
 def get_confidence_level(score):
     """Get confidence level from score."""
     if score >= 15:
@@ -364,25 +412,213 @@ def parse_purchase_order(text):
     if amounts:
         po_data['total_amount'] = max(amounts)
 
-    combined_item_pattern = r'^(\d+)\.?\s+(.+?)\s+(\d+)\s+\$\s*([\d,]+\.?\d*)\s+\$\s*([\d,]+\.?\d*)$'
+    def _to_float(value):
+        try:
+            return float(str(value).replace(',', '').strip())
+        except Exception:
+            return None
+
+    header_tokens = {'item', 'supplier colour', 'colour', 'size', 'quantity', 'unit', 'rate', 'amount', 'amount (usd)'}
+    table_header_pattern = re.compile(r'(?i)\bitem\b.*\b(?:quantity|qty)\b')
+    table_end_pattern = re.compile(r'(?i)\b(?:subtotal|grand\s*total|amount\s*due|total\s*usd|tax|vat)\b')
+
+    def _sanitize_item_name(left):
+        value = left
+        if '|' in value:
+            value = value.split('|', 1)[0].strip()
+        if ';' in value:
+            value = value.split(';')[-1].strip()
+
+        # Keep the last clean "Item : Description" segment if OCR merged multiple lines.
+        pair_matches = re.findall(
+            r'([A-Za-z][A-Za-z0-9&/\-\s]{1,40}:\s*[A-Za-z][A-Za-z0-9&/\-\s]{1,80})',
+            value,
+        )
+        if pair_matches:
+            value = pair_matches[-1]
+
+        value = re.sub(r'\s+', ' ', value).strip(" \t\r\n-:;,.|")
+
+        # Remove common noisy prefixes that appear before the real item text.
+        value = re.sub(r'(?i)^.*?\b(?:stroke\s*number|supplier\s*fi\s*number)\b', '', value).strip()
+
+        tokens = value.split()
+        compact_tokens = []
+        for tok in tokens:
+            if compact_tokens and compact_tokens[-1].lower() == tok.lower():
+                continue
+            compact_tokens.append(tok)
+
+        while len(compact_tokens) > 2 and compact_tokens[-1].isupper() and len(compact_tokens[-1]) <= 3:
+            compact_tokens.pop()
+
+        return ' '.join(compact_tokens).strip()
+
+    def _canonical_item_name(name):
+        """Return a stable item identity for deduping OCR variants."""
+        value = re.sub(r'\s+', ' ', str(name or '')).strip().lower()
+        if ':' in value:
+            value = value.split(':', 1)[0].strip()
+        value = re.sub(r'[^a-z0-9]+', ' ', value)
+        value = re.sub(r'\s+', ' ', value).strip()
+        return value
+
+    def _normalize_num_token(token):
+        cleaned = str(token).strip()
+        cleaned = re.sub(r'(?<=\d)[Oo](?=\d)', '0', cleaned)
+        cleaned = re.sub(r'(?<=\d)[Il](?=\d)', '1', cleaned)
+        cleaned = re.sub(r'[^0-9,\.]', '', cleaned)
+        return cleaned
+
+    def _extract_item_from_line(candidate_line):
+        tokens = [tok for tok in re.split(r'\s+', candidate_line.strip()) if tok]
+        if len(tokens) < 5:
+            return None
+
+        numeric_positions = []
+        for idx, tok in enumerate(tokens):
+            val = _to_float(_normalize_num_token(tok))
+            if val is not None:
+                numeric_positions.append((idx, val))
+
+        if len(numeric_positions) < 2:
+            return None
+
+        if len(numeric_positions) >= 3:
+            qty_idx, qty_val = numeric_positions[-3]
+            rate_idx, rate_val = numeric_positions[-2]
+            amount_idx, amount_val = numeric_positions[-1]
+            if not (qty_idx < rate_idx < amount_idx):
+                return None
+        else:
+            # OCR can miss/scramble rate token (e.g., "0.0215" -> "oz").
+            qty_idx, qty_val = numeric_positions[-2]
+            amount_idx, amount_val = numeric_positions[-1]
+            if not (qty_idx < amount_idx) or qty_val == 0:
+                return None
+            rate_idx = amount_idx
+            rate_val = amount_val / qty_val
+
+        left = ' '.join(tokens[:qty_idx]).strip()
+        left = re.sub(r'^\d+[\).:\-]?\s*', '', left)
+        left = re.sub(r'\s+', ' ', left).strip()
+        if len(left) < 3:
+            return None
+
+        has_row_marker = any(mark in left for mark in [':', '|', ';'])
+        has_unit = bool(unit) if 'unit' in locals() else False
+        if not has_row_marker and not has_unit:
+            return None
+
+        left_lower = left.lower()
+        forbidden_left_tokens = [
+            'supplier address', 'delivery address', 'reference number', 'purchase order number',
+            'stroke number', 'supplier pi number', 'supplier fi number', 'vat number', 'svat number'
+        ]
+        if any(tok in left_lower for tok in forbidden_left_tokens):
+            return None
+        if any(tok in left_lower for tok in header_tokens):
+            return None
+        if any(x in left_lower for x in ['total', 'subtotal', 'payment', 'balance']):
+            return None
+
+        unit = None
+        if qty_idx + 1 < rate_idx:
+            unit_candidate = tokens[qty_idx + 1].lower().strip('.,:;')
+            if unit_candidate in {'piece', 'pieces', 'preces', 'peices', 'pcs', 'nos', 'no', 'sets', 'set'}:
+                unit = unit_candidate.capitalize()
+
+        has_item_hint = any(k in left_lower for k in ['sticker', 'ticket', 'laminating', 'label', 'carton', 'price'])
+        if not unit and not has_item_hint:
+            return None
+
+        left = _sanitize_item_name(left)
+        if len(left) < 3:
+            return None
+        if ':' not in left:
+            return None
+
+        return {
+            'product_name': left,
+            'variant': None,
+            'description': left,
+            'quantity': qty_val,
+            'unit': unit,
+            'price': rate_val,
+            'amount': amount_val,
+        }
+
+    pending_left = None
+    seen_item_keys = set()
+    in_item_table = False
+    carry_block_tokens = [
+        'supplier address', 'delivery address', 'reference number', 'purchase order number',
+        'stroke number', 'supplier pi number', 'supplier fi number', 'vat', 'svat'
+    ]
+
     for line in lines:
         line = line.strip()
         if not line:
+            if in_item_table:
+                pending_left = None
             continue
 
-        match = re.match(combined_item_pattern, line)
-        if match:
-            qty = int(match.group(3))
-            description = match.group(2).strip()
-            rate = float(match.group(4).replace(',', ''))
-            amount = float(match.group(5).replace(',', ''))
-            if not any(x in description.lower() for x in ['total', 'subtotal', 'payment', 'balance']):
-                po_data['items'].append({
-                    'quantity': qty,
-                    'description': description,
-                    'price': rate,
-                    'amount': amount
-                })
+        line_lower = line.lower()
+        if table_header_pattern.search(line):
+            in_item_table = True
+            pending_left = None
+            continue
+
+        if not in_item_table:
+            looks_like_item_line = (':' in line or '|' in line) and re.search(r'\d', line)
+            if not looks_like_item_line:
+                continue
+
+        if table_end_pattern.search(line):
+            in_item_table = False
+            pending_left = None
+            continue
+
+        if any(tok in line_lower for tok in header_tokens):
+            continue
+        if any(x in line_lower for x in ['total', 'subtotal', 'payment', 'balance']):
+            continue
+
+        # Merge split OCR rows: first line has item text, next line has numeric columns.
+        if pending_left:
+            merged_line = f"{pending_left} {line}".strip()
+            pending_left = None
+        else:
+            merged_line = line
+
+        if not re.search(r'\d', merged_line):
+            # Keep likely item text for next line if this line looks like first column content.
+            if ':' in merged_line or len(merged_line.split()) >= 2:
+                pending_left = merged_line
+            continue
+
+        parsed_item = _extract_item_from_line(merged_line)
+        if parsed_item:
+            normalized_name = _canonical_item_name(parsed_item.get('description', ''))
+            item_key = (
+                normalized_name,
+                round(float(parsed_item.get('quantity') or 0), 4),
+                round(float(parsed_item.get('amount') or 0), 4),
+            )
+            if item_key not in seen_item_keys:
+                seen_item_keys.add(item_key)
+                po_data['items'].append(parsed_item)
+            continue
+
+        merged_lower = merged_line.lower()
+        numeric_count = len(re.findall(r'\d[\d,]*\.?\d*', merged_line))
+        blocked_for_carry = any(tok in merged_lower for tok in carry_block_tokens)
+
+        # Carry only true text fragments for the next OCR line; avoid carrying noisy lines.
+        if not blocked_for_carry and numeric_count <= 1 and (':' in merged_line or len(merged_line.split()) >= 2):
+            pending_left = merged_line
+        else:
+            pending_left = None
 
     return po_data
 
@@ -440,7 +676,7 @@ def _extract_text_from_pdf(pdf_bytes):
     return "\n".join(combined_text)
 
 
-def extract_po_from_attachment(attachment):
+def extract_po_from_attachment(attachment, debug=False):
     """Extract PO fields from one attachment (image via OCR or PDF via text extraction)."""
     attachment_bytes = attachment.get('bytes')
     if not attachment_bytes:
@@ -470,6 +706,43 @@ def extract_po_from_attachment(attachment):
         po_data['text_length'] = len(combined_text.strip())
         po_data['raw_text'] = combined_text
         po_data['extraction_status'] = 'processed'
+
+        extracted_items = po_data.get('items', [])
+        log_attachment_debug(
+            debug,
+            f"source_file={name} extracted_items_count={len(extracted_items)}"
+        )
+        if extracted_items:
+            for idx, item in enumerate(extracted_items, start=1):
+                log_attachment_debug(
+                    debug,
+                    "source_file={name} item_{idx} item_name={item_name} quantity={qty} rate={rate} total_amount={amount}".format(
+                        name=name,
+                        idx=idx,
+                        item_name=item.get('product_name') or item.get('description', ''),
+                        qty=item.get('quantity', ''),
+                        rate=item.get('price', ''),
+                        amount=item.get('amount', ''),
+                    )
+                )
+        else:
+            log_attachment_debug(debug, f"source_file={name} no_item_rows_extracted")
+            candidate_lines = []
+            for raw_line in combined_text.splitlines():
+                line = re.sub(r'\s+', ' ', raw_line).strip()
+                if not line:
+                    continue
+                if re.search(r'\d', line) and (
+                    ':' in line or 'piece' in line.lower() or 'qty' in line.lower() or 'amount' in line.lower()
+                ):
+                    candidate_lines.append(line)
+                if len(candidate_lines) >= 20:
+                    break
+            if candidate_lines:
+                log_attachment_debug(debug, f"source_file={name} item_candidate_lines_count={len(candidate_lines)}")
+                for idx, line in enumerate(candidate_lines, start=1):
+                    log_attachment_debug(debug, f"source_file={name} candidate_line_{idx}={line}")
+
         return po_data
     except Exception as e:
         return {
@@ -640,7 +913,7 @@ def extract_po_data_from_attachments(access_token, message_id, debug=False):
             debug,
             f"message_id={message_id} processing_attachment name={attachment.get('name', '')} content_type={attachment.get('contentType', '')}"
         )
-        po_data = extract_po_from_attachment(attachment)
+        po_data = extract_po_from_attachment(attachment, debug=debug)
         if po_data:
             if not po_data.get('po_number') and po_data.get('po_candidates'):
                 po_data['po_number'] = po_data['po_candidates'][0]
@@ -754,19 +1027,32 @@ def main():
         
         if st.session_state.access_token is None:
             st.warning("Not logged in")
+
+            auth_issues = get_auth_config_issues()
+            auth_ready = is_auth_configured()
+            if not auth_ready:
+                st.error(
+                    "OAuth setup incomplete. Set environment variables: "
+                    + ", ".join(auth_issues)
+                )
+                st.code(
+                    "$env:AZURE_CLIENT_ID=\"<your-client-id>\"\n"
+                    "$env:AZURE_CLIENT_SECRET=\"<your-client-secret>\"",
+                    language="powershell"
+                )
             
             st.markdown("### Login with Microsoft")
             st.markdown("Click the button below to login with your Microsoft account.")
             
             auth_url = get_auth_url()
-            st.link_button("🔐 Login with Microsoft", auth_url, width='stretch')
+            st.link_button("🔐 Login with Microsoft", auth_url, width='stretch', disabled=not auth_ready)
             
             st.markdown("---")
             st.caption("Or paste authorization code manually:")
             
             auth_code = st.text_input("Authorization Code:", type="password", label_visibility="collapsed", placeholder="Paste code here...")
             
-            if st.button("🔓 Login", width='stretch', disabled=not auth_code):
+            if st.button("🔓 Login", width='stretch', disabled=(not auth_code) or (not auth_ready)):
                 with st.spinner("Authenticating..."):
                     token_data = get_token_from_code(auth_code)
                     if token_data and 'access_token' in token_data:
@@ -981,6 +1267,9 @@ def main():
                             merged_po_numbers = sorted(set(
                                 extract_po_numbers(f"{subject} {body_text}") + attachment_po_numbers
                             ))
+                            supplier_name = extract_supplier_name_from_email_body(body_text)
+                            if supplier_name in {'Supplier', 'Supplier Team', 'Vendor', 'Vendor Team'}:
+                                supplier_name = None
                             
                             _, icon = get_confidence_level(score)
                             
@@ -1002,6 +1291,7 @@ def main():
                                 'item_codes': extract_item_codes(f"{subject} {body_text}"),
                                 'attachment_po_data': attachment_po_data,
                                 'attachment_po_numbers': attachment_po_numbers,
+                                'supplier_name': supplier_name,
                                 'matched_keywords': keywords,
                                 'matched_patterns': patterns,
                             })
@@ -1090,8 +1380,6 @@ def main():
                                 st.markdown(f"**PO Numbers:** `{', '.join(email['po_numbers'])}`")
                             if email.get('attachment_po_numbers'):
                                 st.markdown(f"**PO Numbers (Attachment OCR/PDF):** `{', '.join(email['attachment_po_numbers'])}`")
-                            if email['item_codes']:
-                                st.markdown(f"**Item Codes:** `{', '.join(email['item_codes'])}`")
                         
                         with col2:
                             st.markdown(f"**Confidence:** :{confidence_color}[{email['confidence']}]")
@@ -1121,11 +1409,22 @@ def main():
                                 if po.get('text_length') is not None:
                                     details.append(f"Text chars: {po['text_length']}")
                                 if po.get('items'):
-                                    qty_total = sum(item.get('quantity', 0) for item in po['items'])
-                                    details.append(f"Qty: {qty_total}")
+                                    qty_total = sum(float(item.get('quantity', 0) or 0) for item in po['items'])
+                                    details.append(f"Items: {len(po['items'])}")
+                                    details.append(f"Qty: {qty_total:g}")
                                 if po.get('error'):
                                     details.append(f"Error: {po['error']}")
                                 st.caption(f"• {po.get('source_file', 'attachment')} | {' | '.join(details) if details else 'No structured fields found'}")
+                                if po.get('items'):
+                                    item_rows = []
+                                    for item in po['items'][:10]:
+                                        item_rows.append({
+                                            'Item Name': item.get('product_name') or item.get('description', ''),
+                                            'Quantity': item.get('quantity', ''),
+                                            'Rate': item.get('price', ''),
+                                            'Total Amount': item.get('amount', ''),
+                                        })
+                                    st.dataframe(pd.DataFrame(item_rows), width='stretch')
                 
                 # Export functionality
                 st.markdown("---")
@@ -1134,21 +1433,42 @@ def main():
                 if st.button("Export to CSV", type="primary"):
                     export_data = []
                     for email in po_emails:
-                        export_data.append({
+                        base_row = {
                             'Subject': email['subject'],
                             'From': email['from'],
                             'From Name': email['from_name'],
                             'Date': email['date'],
                             'PO Numbers': '; '.join(email['po_numbers']),
-                            'Item Codes': '; '.join(email['item_codes']),
                             'Confidence': email['confidence'],
                             'Score': email['score'],
                             'Has Attachments': email['has_attachments'],
                             'Attachments': '; '.join(email['attachments']),
                             'Attachment PO Numbers': '; '.join(email.get('attachment_po_numbers', [])),
                             'Attachment Extraction Count': len(email.get('attachment_po_data', [])),
-                            'Body Preview': email['body'][:200]
-                        })
+                            'Body Preview': email['body'][:200],
+                        }
+
+                        attachment_items = []
+                        for po in email.get('attachment_po_data', []):
+                            for item in po.get('items', []):
+                                attachment_items.append({
+                                    'Item Name': str(item.get('product_name') or item.get('description', '')),
+                                    'Quantity': str(item.get('quantity', '')),
+                                    'Rate': str(item.get('price', '')),
+                                    'Total Amount': str(item.get('amount', '')),
+                                })
+
+                        if attachment_items:
+                            for item_row in attachment_items:
+                                export_data.append({**base_row, **item_row})
+                        else:
+                            export_data.append({
+                                **base_row,
+                                'Item Name': '',
+                                'Quantity': '',
+                                'Rate': '',
+                                'Total Amount': '',
+                            })
                     
                     df = pd.DataFrame(export_data)
                     csv = df.to_csv(index=False).encode('utf-8-sig')

@@ -2,6 +2,12 @@
 __pycache__/
 *.py[cod]
 
+# Local secrets
+.env
+*.env
+!*.env.example
+streamlit_app/.env
+
 # Model training checkpoints and artifacts
 streamlit_app/models/po_classifier/checkpoint-*/
 streamlit_app/models/po_classifier/**/optimizer.pt

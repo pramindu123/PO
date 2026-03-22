@@ -7,6 +7,27 @@ You can also set these as environment variables instead.
 
 import os
 
+
+def _load_env_file(env_path):
+    """Load KEY=VALUE pairs from a local .env file into os.environ."""
+    if not os.path.exists(env_path):
+        return
+
+    with open(env_path, "r", encoding="utf-8") as env_file:
+        for raw_line in env_file:
+            line = raw_line.strip()
+            if not line or line.startswith("#") or "=" not in line:
+                continue
+
+            key, value = line.split("=", 1)
+            key = key.strip()
+            value = value.strip().strip('"').strip("'")
+            if key and key not in os.environ:
+                os.environ[key] = value
+
+
+_load_env_file(os.path.join(os.path.dirname(__file__), ".env"))
+
 # ============== Azure AD App Configuration ==============
 # Register your app at https://portal.azure.com
 
@@ -20,7 +41,7 @@ CLIENT_ID = os.getenv("AZURE_CLIENT_ID", "")
 CLIENT_SECRET = os.getenv("AZURE_CLIENT_SECRET", "")
 
 # Redirect URI (must match the one in Azure AD app registration)
-REDIRECT_URI = "http://localhost:8502"
+REDIRECT_URI = os.getenv("AZURE_REDIRECT_URI", "http://localhost:8502")
 
 # Tenant ID options:
 # - "common" = Any Microsoft account (personal or work/school) - RECOMMENDED
@@ -30,7 +51,7 @@ REDIRECT_URI = "http://localhost:8502"
 #
 # IMPORTANT: Your Azure AD app must be registered with:
 # "Accounts in any organizational directory and personal Microsoft accounts"
-TENANT_ID = "common"  # Supports both personal and work/school accounts
+TENANT_ID = os.getenv("AZURE_TENANT_ID", "common")  # Supports both personal and work/school accounts
 
 
 # ============== App Settings ==============
