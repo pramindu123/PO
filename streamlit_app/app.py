@@ -4,6 +4,7 @@ import re
 import os
 import json
 import base64
+import html
 from datetime import datetime, timedelta
 import requests
 from io import BytesIO
@@ -90,6 +91,29 @@ def log_attachment_debug(enabled, message):
     """Print attachment extraction debug details to the terminal when enabled."""
     if enabled:
         print(f"[ATTACH_DEBUG] {message}")
+
+
+def log_body_debug(enabled, message):
+    """Print email body extraction debug details to the terminal when enabled."""
+    if enabled:
+        print(f"[BODY_DEBUG] {message}")
+
+
+def clean_email_body_text(body_content):
+    """Convert HTML email body into readable plain text while preserving line breaks."""
+    if not body_content:
+        return ""
+
+    text = str(body_content)
+    # Preserve common block-level separators before stripping tags.
+    text = re.sub(r'(?i)<br\s*/?>', '\n', text)
+    text = re.sub(r'(?i)</(p|div|li|tr|h1|h2|h3|h4|h5|h6)>', '\n', text)
+    text = re.sub(r'(?i)<li[^>]*>', '- ', text)
+    text = re.sub(r'<[^>]+>', '', text)
+    text = html.unescape(text)
+    text = text.replace('\r\n', '\n').replace('\r', '\n')
+    text = re.sub(r'\n{3,}', '\n\n', text)
+    return text.strip()
 
 
 def calculate_po_score(subject, body, attachments=None):
@@ -207,6 +231,151 @@ def extract_item_codes(text):
         items.extend(re.findall(pattern, text, re.IGNORECASE))
     
     return list(set(items))
+
+
+def extract_items_from_email_body(text, debug=False, message_id=None):
+    """Extract item details from plain email body text."""
+    if not text:
+        log_body_debug(debug, f"message_id={message_id} body_empty")
+        return []
+
+    def _to_float(value):
+        try:
+            return float(str(value).replace(',', '').strip())
+        except Exception:
+            return None
+
+    normalized = str(text).replace('\u2013', '-').replace('\u2014', '-').replace('\u2212', '-')
+    lines = []
+    for ln in normalized.splitlines():
+        cleaned_line = re.sub(r'\s+', ' ', ln).strip()
+        cleaned_line = re.sub(r'^[\-\*\u2022•]+\s*', '', cleaned_line)
+        if cleaned_line:
+            lines.append(cleaned_line)
+
+    header_block = {
+        'item', 'item description', 'product', 'quantity', 'unit', 'unit price', 'line total', 'amount', 'rate'
+    }
+    parsed_items = []
+    seen = set()
+
+    dash_pattern = re.compile(
+        r'^(?P<name>[A-Za-z][A-Za-z0-9&/\-\s]+?)\s*-\s*(?P<qty>\d[\d,]*)\s*(?P<unit>pcs?|pieces?)\s*-\s*(?:USD\s*)?(?P<rate>\d+(?:\.\d+)?)$',
+        re.IGNORECASE,
+    )
+    table_with_amount_pattern = re.compile(
+        r'^(?P<name>[A-Za-z][A-Za-z0-9&/\-\s]+?)\s+(?P<qty>\d[\d,]*)\s*(?P<unit>pcs?|pieces?)\s+(?P<rate>\d+(?:\.\d+)?)\s*(?:USD)?\s+(?P<amount>\d+(?:\.\d+)?)$',
+        re.IGNORECASE,
+    )
+    table_no_amount_pattern = re.compile(
+        r'^(?P<name>[A-Za-z][A-Za-z0-9&/\-\s]+?)\s+(?P<qty>\d[\d,]*)\s*(?P<unit>pcs?|pieces?)\s+(?:USD\s*)?(?P<rate>\d+(?:\.\d+)?)$',
+        re.IGNORECASE,
+    )
+    compact_dash_pattern = re.compile(
+        r'^(?P<name>[A-Za-z][A-Za-z0-9&/\-\s]+?)\s*-\s*(?P<qty>\d[\d,]*)\s*(?P<unit>pcs?|pieces?)\s*-\s*(?P<currency>USD)?\s*(?P<rate>\d+(?:\.\d+)?)\s*(?:USD)?$',
+        re.IGNORECASE,
+    )
+    labeled_dash_pattern = re.compile(
+        r'^(?P<name>[A-Za-z][A-Za-z0-9&/\-\s]+?)\s*-\s*Quantity\s*:\s*(?P<qty>\d[\d,]*)\s*(?P<unit>pcs?|pieces?)\s*-\s*(?:Unit\s*)?(?:Rate|Price)\s*:\s*(?P<rate>\d+(?:\.\d+)?)\s*(?:USD)?(?:\s*-\s*(?:Line\s*Total|Amount)\s*:\s*(?P<amount>\d+(?:\.\d+)?))?$',
+        re.IGNORECASE,
+    )
+
+    # Fallback for HTML tables flattened into one long line.
+    full_text_table_pattern = re.compile(
+        r'(?P<name>[A-Za-z][A-Za-z0-9&/\-\s]{2,40}?)\s+(?P<qty>\d[\d,]*)\s*(?P<unit>pcs?|pieces?)\s+(?P<rate>\d+(?:\.\d+)?)\s*(?:USD)?\s+(?P<amount>\d+(?:\.\d+)?)',
+        re.IGNORECASE,
+    )
+
+    log_body_debug(debug, f"message_id={message_id} body_lines={len(lines)}")
+    candidate_lines = []
+    for line in lines:
+        lower = line.lower()
+        if lower in header_block:
+            continue
+        if any(h in lower for h in ['itemized order breakdown', 'description value', 'net amount', 'subtotal', 'grand total']):
+            continue
+
+        if any(tok in lower for tok in ['sticker', 'ticket', 'pcs', 'pieces', 'usd', 'unit price', 'line total']):
+            candidate_lines.append(line)
+
+        match = (
+            dash_pattern.match(line)
+            or compact_dash_pattern.match(line)
+            or labeled_dash_pattern.match(line)
+            or table_with_amount_pattern.match(line)
+            or table_no_amount_pattern.match(line)
+        )
+        if not match:
+            continue
+
+        name = re.sub(r'\s+', ' ', match.group('name')).strip(' -:;,.')
+        qty = _to_float(match.group('qty'))
+        rate = _to_float(match.group('rate'))
+        amount = _to_float(match.groupdict().get('amount'))
+        if qty is None or rate is None:
+            continue
+        if amount is None:
+            amount = round(qty * rate, 4)
+
+        key = (name.lower(), round(qty, 4), round(rate, 6), round(amount, 4))
+        if key in seen:
+            continue
+        seen.add(key)
+
+        parsed_items.append({
+            'product_name': name,
+            'quantity': qty,
+            'price': rate,
+            'amount': amount,
+            'unit': match.group('unit').capitalize(),
+            'source': 'body',
+        })
+
+    log_body_debug(debug, f"message_id={message_id} body_items_extracted={len(parsed_items)}")
+
+    # Second pass: parse from whole text when body collapsed to one line/table-like stream.
+    if not parsed_items:
+        collapsed_text = re.sub(r'\s+', ' ', normalized)
+        for match in full_text_table_pattern.finditer(collapsed_text):
+            name = re.sub(r'\s+', ' ', match.group('name')).strip(' -:;,.')
+            lower_name = name.lower()
+            if any(bad in lower_name for bad in ['itemized order breakdown', 'item description', 'quantity', 'unit price', 'line total']):
+                continue
+
+            qty = _to_float(match.group('qty'))
+            rate = _to_float(match.group('rate'))
+            amount = _to_float(match.group('amount'))
+            if qty is None or rate is None or amount is None:
+                continue
+
+            key = (name.lower(), round(qty, 4), round(rate, 6), round(amount, 4))
+            if key in seen:
+                continue
+            seen.add(key)
+            parsed_items.append({
+                'product_name': name,
+                'quantity': qty,
+                'price': rate,
+                'amount': amount,
+                'unit': match.group('unit').capitalize(),
+                'source': 'body',
+            })
+
+        if parsed_items:
+            log_body_debug(debug, f"message_id={message_id} body_items_extracted_fallback={len(parsed_items)}")
+
+    if debug and parsed_items:
+        for idx, item in enumerate(parsed_items, start=1):
+            log_body_debug(
+                debug,
+                f"message_id={message_id} body_item_{idx} item_name={item.get('product_name')} quantity={item.get('quantity')} rate={item.get('price')} total_amount={item.get('amount')}"
+            )
+    elif debug and candidate_lines:
+        log_body_debug(debug, f"message_id={message_id} body_candidate_lines_count={len(candidate_lines)}")
+        for idx, line in enumerate(candidate_lines[:20], start=1):
+            log_body_debug(debug, f"message_id={message_id} body_candidate_line_{idx}={line}")
+
+    return parsed_items
 
 
 def extract_supplier_name_from_email_body(text):
@@ -1215,9 +1384,9 @@ def main():
                         
                         for idx, email in enumerate(st.session_state.emails):
                             subject = email.get('subject', '')
+                            message_id = email.get('id', '')
                             body_content = email.get('body', {}).get('content', '')
-                            # Strip HTML tags
-                            body_text = re.sub(r'<[^>]+>', '', body_content)
+                            body_text = clean_email_body_text(body_content)
                             
                             # Get attachments if any
                             attachments = []
@@ -1270,6 +1439,11 @@ def main():
                             supplier_name = extract_supplier_name_from_email_body(body_text)
                             if supplier_name in {'Supplier', 'Supplier Team', 'Vendor', 'Vendor Team'}:
                                 supplier_name = None
+                            body_items = extract_items_from_email_body(
+                                body_text,
+                                debug=debug_attachment_extraction,
+                                message_id=message_id,
+                            )
                             
                             _, icon = get_confidence_level(score)
                             
@@ -1291,6 +1465,7 @@ def main():
                                 'item_codes': extract_item_codes(f"{subject} {body_text}"),
                                 'attachment_po_data': attachment_po_data,
                                 'attachment_po_numbers': attachment_po_numbers,
+                                'body_items': body_items,
                                 'supplier_name': supplier_name,
                                 'matched_keywords': keywords,
                                 'matched_patterns': patterns,
@@ -1392,6 +1567,18 @@ def main():
                         st.markdown("**Body Preview:**")
                         st.text(email['body'][:300] + "..." if len(email['body']) > 300 else email['body'])
 
+                        if email.get('body_items'):
+                            st.markdown("**Body Item Extraction:**")
+                            body_rows = []
+                            for item in email['body_items'][:20]:
+                                body_rows.append({
+                                    'Item Name': item.get('product_name', ''),
+                                    'Quantity': item.get('quantity', ''),
+                                    'Rate': item.get('price', ''),
+                                    'Total Amount': item.get('amount', ''),
+                                })
+                            st.dataframe(pd.DataFrame(body_rows), width='stretch')
+
                         if email.get('attachment_po_data'):
                             st.markdown("**Attachment Extraction:**")
                             for po in email['attachment_po_data']:
@@ -1448,18 +1635,28 @@ def main():
                             'Body Preview': email['body'][:200],
                         }
 
-                        attachment_items = []
+                        all_items = []
+                        for item in email.get('body_items', []):
+                            all_items.append({
+                                'Item Name': str(item.get('product_name') or item.get('description', '')),
+                                'Quantity': str(item.get('quantity', '')),
+                                'Rate': str(item.get('price', '')),
+                                'Total Amount': str(item.get('amount', '')),
+                                'Item Source': 'Body',
+                            })
+
                         for po in email.get('attachment_po_data', []):
                             for item in po.get('items', []):
-                                attachment_items.append({
+                                all_items.append({
                                     'Item Name': str(item.get('product_name') or item.get('description', '')),
                                     'Quantity': str(item.get('quantity', '')),
                                     'Rate': str(item.get('price', '')),
                                     'Total Amount': str(item.get('amount', '')),
+                                    'Item Source': f"Attachment:{po.get('source_file', 'file')}",
                                 })
 
-                        if attachment_items:
-                            for item_row in attachment_items:
+                        if all_items:
+                            for item_row in all_items:
                                 export_data.append({**base_row, **item_row})
                         else:
                             export_data.append({
@@ -1468,6 +1665,7 @@ def main():
                                 'Quantity': '',
                                 'Rate': '',
                                 'Total Amount': '',
+                                'Item Source': '',
                             })
                     
                     df = pd.DataFrame(export_data)
