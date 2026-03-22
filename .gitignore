@@ -1,0 +1,25 @@
+# Python cache
+__pycache__/
+*.py[cod]
+
+# Model training checkpoints and artifacts
+streamlit_app/models/po_classifier/checkpoint-*/
+streamlit_app/models/po_classifier/**/optimizer.pt
+streamlit_app/models/po_classifier/**/rng_state.pth
+streamlit_app/models/po_classifier/**/scheduler.pt
+streamlit_app/models/po_classifier/**/trainer_state.json
+streamlit_app/models/po_classifier/**/training_args.bin
+
+# Large model files (use LFS or download separately)
+streamlit_app/models/po_classifier/model.safetensors
+streamlit_app/models/**/*.safetensors
+streamlit_app/models/**/*.bin
+streamlit_app/models/**/*.pt
+
+# Tessarray OCR binaries and data (precompiled, not source code)
+tessaret/
+
+# Optional large generated outputs
+output/
+preprocessed_images/
+gemini_processed_images/
