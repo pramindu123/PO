@@ -7,11 +7,22 @@ import base64
 import html
 from datetime import datetime, timedelta
 import requests
-from io import BytesIO
+from io import BytesIO, StringIO
+
+try:
+    import torch
+    from transformers import LayoutLMv3Processor, LayoutLMv3ForTokenClassification
+    LAYOUTLMV3_AVAILABLE = True
+except Exception:
+    LAYOUTLMV3_AVAILABLE = False
+    LayoutLMv3Processor = None
+    LayoutLMv3ForTokenClassification = None
+    torch = None
 
 # Microsoft Graph API endpoints
 GRAPH_API_ENDPOINT = "https://graph.microsoft.com/v1.0"
 PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+LABEL_OVERRIDES_PATH = os.path.join(PROJECT_ROOT, "output", "user_label_overrides.json")
 
 # Import authentication module
 from auth import (
@@ -86,6 +97,132 @@ PO_NUMBER_PATTERNS = [
     r'\bPurchase\s*Order\s*#?\s*[:\-]?\s*([A-Z0-9-]*\d[A-Z0-9-]*)\b',
 ]
 
+MASTER_COLUMNS = [
+    'Type',
+    'Contract No',
+    'Item Category',
+    '5lb',
+    'First Size',
+    'Up To 1Mth',
+    'Up To 3Mth',
+    '3-6 Mths',
+    '6-9 Mths',
+    '9-12 Mths',
+    '12-18 Mths',
+    '1.5-2 Yrs',
+    'Total',
+]
+
+MASTER_TEXT_COLUMNS = {'Type', 'Contract No', 'Item Category'}
+MASTER_NUMERIC_COLUMNS = [col for col in MASTER_COLUMNS if col not in MASTER_TEXT_COLUMNS]
+
+MASTER_SIZE_ALIASES = {
+    '5lb': {'5lb', '5 lb'},
+    'First Size': {'first size'},
+    'Up To 1Mth': {'up to 1mth', 'up to 1 mth', 'upto 1mth', 'up to 1 month'},
+    'Up To 3Mth': {'up to 3mth', 'up to 3 mth', 'upto 3mth', 'up to 3 month'},
+    '3-6 Mths': {'3-6 mths', '3 6 mths', '3-6 months', '3 to 6 mths'},
+    '6-9 Mths': {'6-9 mths', '6 9 mths', '6-9 months', '6 to 9 mths'},
+    '9-12 Mths': {'9-12 mths', '9 12 mths', '9-12 months', '9 to 12 mths'},
+    '12-18 Mths': {'12-18 mths', '12 18 mths', '12-18 months', '12 to 18 mths'},
+    '1.5-2 Yrs': {'1.5-2 yrs', '15-2 yrs', '1.5 2 yrs', '1.5-2 years'},
+    'Total': {'total'},
+}
+
+_LAYOUTLMV3_CACHE = {
+    'loaded': False,
+    'processor': None,
+    'model': None,
+}
+
+
+def _empty_master_row():
+    row = {col: '' for col in MASTER_TEXT_COLUMNS}
+    for col in MASTER_NUMERIC_COLUMNS:
+        row[col] = None
+    return row
+
+
+def _canonical_master_size_key(raw_key):
+    normalized = re.sub(r'\s+', ' ', str(raw_key or '').strip().lower())
+    normalized = normalized.replace('.', '')
+    normalized = normalized.replace('_', ' ')
+    normalized = normalized.replace('months', 'mths').replace('month', 'mth')
+    normalized = normalized.replace('years', 'yrs').replace('year', 'yrs')
+    for canonical, aliases in MASTER_SIZE_ALIASES.items():
+        if normalized in aliases:
+            return canonical
+    return None
+
+
+def _get_layoutlmv3_components(debug=False):
+    if _LAYOUTLMV3_CACHE['loaded']:
+        return _LAYOUTLMV3_CACHE['processor'], _LAYOUTLMV3_CACHE['model']
+
+    _LAYOUTLMV3_CACHE['loaded'] = True
+    if not LAYOUTLMV3_AVAILABLE:
+        log_body_debug(debug, "layoutlmv3_unavailable transformers_or_torch_missing")
+        return None, None
+
+    model_path = os.getenv('LAYOUTLMV3_MODEL_PATH', '').strip()
+    if not model_path:
+        log_body_debug(debug, "layoutlmv3_disabled set LAYOUTLMV3_MODEL_PATH for fine-tuned model")
+        return None, None
+
+    try:
+        processor = LayoutLMv3Processor.from_pretrained(model_path, apply_ocr=False)
+        model = LayoutLMv3ForTokenClassification.from_pretrained(model_path)
+        model.eval()
+        _LAYOUTLMV3_CACHE['processor'] = processor
+        _LAYOUTLMV3_CACHE['model'] = model
+        log_body_debug(debug, f"layoutlmv3_loaded path={model_path}")
+    except Exception as exc:
+        log_body_debug(debug, f"layoutlmv3_load_failed error={exc}")
+        _LAYOUTLMV3_CACHE['processor'] = None
+        _LAYOUTLMV3_CACHE['model'] = None
+
+    return _LAYOUTLMV3_CACHE['processor'], _LAYOUTLMV3_CACHE['model']
+
+
+def _layoutlmv3_confirms_item_label(label_text, debug=False):
+    """Use a fine-tuned LayoutLMv3 model to confirm whether a row label is an item category."""
+    processor, model = _get_layoutlmv3_components(debug=debug)
+    if processor is None or model is None or torch is None:
+        return None
+
+    words = [w for w in re.split(r'\s+', str(label_text or '').strip()) if w]
+    if not words:
+        return None
+
+    # Synthetic bounding boxes keep token order; useful when only row label text is available.
+    boxes = []
+    left = 50
+    for _ in words:
+        right = min(left + 110, 980)
+        boxes.append([left, 400, right, 520])
+        left = min(right + 10, 980)
+
+    try:
+        from PIL import Image as PILImage
+        dummy_image = PILImage.new('RGB', (1000, 1000), color='white')
+        encoded = processor(
+            images=dummy_image,
+            words=words,
+            boxes=boxes,
+            truncation=True,
+            return_tensors='pt',
+        )
+        with torch.no_grad():
+            logits = model(**encoded).logits
+        predicted = torch.argmax(logits, dim=-1)[0].tolist()
+
+        id2label = getattr(model.config, 'id2label', {}) or {}
+        labels = [str(id2label.get(idx, '')).upper() for idx in predicted]
+        return any('ITEM' in lbl or 'CATEGORY' in lbl for lbl in labels)
+    except Exception as exc:
+        log_body_debug(debug, f"layoutlmv3_infer_failed error={exc}")
+        return None
+
 
 def log_attachment_debug(enabled, message):
     """Print attachment extraction debug details to the terminal when enabled."""
@@ -97,6 +234,36 @@ def log_body_debug(enabled, message):
     """Print email body extraction debug details to the terminal when enabled."""
     if enabled:
         print(f"[BODY_DEBUG] {message}")
+
+
+def load_user_label_overrides(path=LABEL_OVERRIDES_PATH):
+    """Load persisted PO/non-PO label overrides keyed by message id."""
+    try:
+        if not os.path.exists(path):
+            return {}
+        with open(path, 'r', encoding='utf-8') as handle:
+            payload = json.load(handle)
+        if not isinstance(payload, dict):
+            return {}
+        normalized = {}
+        for key, value in payload.items():
+            if key:
+                normalized[str(key)] = bool(value)
+        return normalized
+    except Exception:
+        return {}
+
+
+def save_user_label_overrides(overrides, path=LABEL_OVERRIDES_PATH):
+    """Persist PO/non-PO label overrides for future runs."""
+    try:
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        clean = {str(k): bool(v) for k, v in (overrides or {}).items() if k}
+        with open(path, 'w', encoding='utf-8') as handle:
+            json.dump(clean, handle, indent=2)
+        return True
+    except Exception:
+        return False
 
 
 def clean_email_body_text(body_content):
@@ -114,6 +281,54 @@ def clean_email_body_text(body_content):
     text = text.replace('\r\n', '\n').replace('\r', '\n')
     text = re.sub(r'\n{3,}', '\n\n', text)
     return text.strip()
+
+
+def extract_html_tables_fallback(html_content):
+    """Extract HTML tables with a lightweight parser when pandas.read_html engines are unavailable."""
+    if not html_content:
+        return []
+
+    html_text = str(html_content)
+    table_blocks = re.findall(r'(?is)<table\b[^>]*>.*?</table>', html_text)
+    extracted = []
+
+    def _cell_text(cell_html):
+        value = re.sub(r'(?i)<br\s*/?>', ' ', str(cell_html))
+        value = re.sub(r'<[^>]+>', ' ', value)
+        value = html.unescape(value)
+        value = re.sub(r'\s+', ' ', value).strip()
+        return value
+
+    def _looks_like_header(row_values):
+        joined = ' '.join(v.lower() for v in row_values if v)
+        hints = ['type', 'contract', 'item', 'size', 'mth', 'yrs', 'total', 'sticker', 'ticket', 'pos']
+        return any(h in joined for h in hints)
+
+    for table_html in table_blocks:
+        row_blocks = re.findall(r'(?is)<tr\b[^>]*>.*?</tr>', table_html)
+        rows = []
+        for row_html in row_blocks:
+            cell_blocks = re.findall(r'(?is)<t[hd]\b[^>]*>.*?</t[hd]>', row_html)
+            if not cell_blocks:
+                continue
+            row_values = [_cell_text(cell) for cell in cell_blocks]
+            if any(val for val in row_values):
+                rows.append(row_values)
+
+        if not rows:
+            continue
+
+        max_cols = max(len(r) for r in rows)
+        normalized_rows = [r + [''] * (max_cols - len(r)) for r in rows]
+
+        if len(normalized_rows) >= 2 and _looks_like_header(normalized_rows[0]):
+            df = pd.DataFrame(normalized_rows[1:], columns=normalized_rows[0])
+        else:
+            df = pd.DataFrame(normalized_rows)
+
+        extracted.append(df)
+
+    return extracted
 
 
 def calculate_po_score(subject, body, attachments=None):
@@ -233,9 +448,9 @@ def extract_item_codes(text):
     return list(set(items))
 
 
-def extract_items_from_email_body(text, debug=False, message_id=None):
+def extract_items_from_email_body(text, debug=False, message_id=None, raw_html=None):
     """Extract item details from plain email body text."""
-    if not text:
+    if not text and not raw_html:
         log_body_debug(debug, f"message_id={message_id} body_empty")
         return []
 
@@ -245,7 +460,7 @@ def extract_items_from_email_body(text, debug=False, message_id=None):
         except Exception:
             return None
 
-    normalized = str(text).replace('\u2013', '-').replace('\u2014', '-').replace('\u2212', '-')
+    normalized = str(text or '').replace('\u2013', '-').replace('\u2014', '-').replace('\u2212', '-')
     lines = []
     for ln in normalized.splitlines():
         cleaned_line = re.sub(r'\s+', ' ', ln).strip()
@@ -258,6 +473,412 @@ def extract_items_from_email_body(text, debug=False, message_id=None):
     }
     parsed_items = []
     seen = set()
+    debug_stats = {
+        'html_tables_found': 0,
+        'tables_skipped_not_item': 0,
+        'rows_seen': 0,
+        'rows_skipped_empty_or_helper': 0,
+        'rows_skipped_no_numeric_cells': 0,
+        'rows_skipped_no_total': 0,
+        'rows_skipped_non_item': 0,
+        'rows_skipped_layoutlmv3_reject': 0,
+        'rows_skipped_duplicate': 0,
+        'rows_extracted_from_html': 0,
+        'rows_extracted_from_text': 0,
+        'rows_extracted_from_fallback': 0,
+    }
+    log_body_debug(
+        debug,
+        f"message_id={message_id} body_debug_start plain_text_chars={len(normalized)} raw_html_chars={len(str(raw_html or ''))}"
+    )
+
+    # First pass: parse true HTML tables before flattened text parsing.
+    def _flatten_columns(columns):
+        flattened = []
+        for col in columns:
+            if isinstance(col, tuple):
+                parts = [str(p).strip() for p in col if str(p).strip() and str(p).strip().lower() != 'nan']
+                flattened.append(' '.join(parts) if parts else '')
+            else:
+                flattened.append(str(col).strip())
+        return [re.sub(r'\s+', ' ', c) for c in flattened]
+
+    def _normalize_header(name):
+        lowered = str(name or '').strip().lower()
+        lowered = lowered.replace('.', '').replace('_', ' ')
+        lowered = re.sub(r'\s+', ' ', lowered)
+        return lowered
+
+    def _is_size_like_header(name):
+        h = _normalize_header(name)
+        if not h:
+            return False
+        return any(token in h for token in ['mth', 'mths', 'yrs', 'year', 'size', 'lb', 'total'])
+
+    def _safe_text(value):
+        if value is None:
+            return ''
+        as_text = str(value).strip()
+        if as_text.lower() == 'nan':
+            return ''
+        return re.sub(r'\s+', ' ', as_text)
+
+    def _find_contract_no(table_values):
+        flattened_text = ' '.join(_safe_text(v) for v in table_values)
+        match = re.search(r'\b(?:VA|VJ|VQ|VB)\d{6,}\b', flattened_text, re.IGNORECASE)
+        return match.group(0).upper() if match else None
+
+    def _find_po_type(table_values):
+        flattened_text = ' '.join(_safe_text(v).lower() for v in table_values)
+        if 'online' in flattened_text:
+            return 'Online'
+        if 'retail' in flattened_text:
+            return 'Retail'
+        return None
+
+    def _extract_scalar_text(value):
+        """Return normalized text for scalar, Series, or DataFrame cell selections."""
+        if isinstance(value, pd.DataFrame):
+            parts = value.astype(str).values.flatten().tolist()
+            text = ' '.join(_safe_text(v) for v in parts)
+        elif isinstance(value, pd.Series):
+            parts = value.astype(str).tolist()
+            text = ' '.join(_safe_text(v) for v in parts)
+        elif isinstance(value, (list, tuple, set)):
+            text = ' '.join(_safe_text(v) for v in value)
+        else:
+            text = _safe_text(value)
+
+        text = re.sub(r'\s+Name\s*:\s*\d+\s*,\s*dtype\s*:\s*\w+\s*$', '', text, flags=re.IGNORECASE)
+        text = re.sub(r'\s*dtype\s*:\s*\w+\s*$', '', text, flags=re.IGNORECASE)
+        text = re.sub(r'\s+', ' ', text).strip()
+        return text
+
+    def _derive_item_category(row, non_size_cols, po_type, contract_no):
+        """Derive clean item category text from non-size columns in a row."""
+        raw_parts = [_extract_scalar_text(row.get(col, '')) for col in non_size_cols]
+        raw_parts = [p for p in raw_parts if p and p.lower() not in {'nan', 'none'}]
+        if not raw_parts:
+            return ''
+
+        def _extract_known_category(text):
+            value = str(text or '')
+            value = re.sub(r'\b(?:Type|Contract\s*No|Contract\s*Number)\b', ' ', value, flags=re.IGNORECASE)
+            value = re.sub(r'\b(?:Online|Retail)\b', ' ', value, flags=re.IGNORECASE)
+            value = re.sub(r'\b(?:VA|VJ|VQ)\d{6,}\b', ' ', value, flags=re.IGNORECASE)
+            value = re.sub(r'\s+', ' ', value).strip(' -:;,.')
+            lowered = value.lower()
+
+            category_patterns = [
+                (r'^\s*7\s*%\s*$', '7%'),
+                (r'\bbase\s*(?:qty|quantity|number)?\b', 'Base Qty'),
+                (r'\bprice\s*ticket\b', 'PRICE TICKET'),
+                (r'\bcarto+n\s*sticker\b|\bcarton\s*sticker\b|\bcarton\s*stk\b|\bcartoon\s*stk\b', 'Carton stk'),
+                (r'\blaminat(?:ing|e)\s*sticker\b|\blaminating\s*stk\b|\blaminate\s*stk\b|\blaminating\b', 'Laminating Stk'),
+                (r'\bpos\b', 'POS'),
+            ]
+
+            matches = []
+            for pattern, canonical in category_patterns:
+                if re.search(pattern, lowered, flags=re.IGNORECASE):
+                    matches.append(canonical)
+
+            if len(matches) == 1:
+                return matches[0]
+            if len(matches) > 1:
+                # Headers can contain mixed labels (e.g. "POS & CARTON STICKER"); treat as non-row noise.
+                return ''
+            return ''
+
+        blocked_exact = {
+            'type', 'contract no', 'contract number', 'item category', 'dir',
+            'online', 'retail'
+        }
+        known_keywords = ['pos', 'carton stk', 'cartoon sticker', 'carton sticker', 'laminating stk', 'laminating', 'price ticket']
+
+        candidates = []
+        contract_pattern = re.compile(r'\b(?:VA|VJ|VQ|VB)\d{6,}\b', re.IGNORECASE)
+        for part in raw_parts:
+            cleaned = re.sub(r'\s+', ' ', part).strip(' -:;,.')
+            if not cleaned:
+                continue
+            lowered = cleaned.lower()
+            if lowered in blocked_exact:
+                continue
+            if po_type and lowered == po_type.lower():
+                continue
+            if contract_no and cleaned.upper() == str(contract_no).upper():
+                continue
+            if contract_pattern.fullmatch(cleaned):
+                continue
+            candidates.append(cleaned)
+
+        if not candidates:
+            return _extract_scalar_text(raw_parts[-1])
+
+        for candidate in candidates:
+            known = _extract_known_category(candidate)
+            if known:
+                return known
+
+        for candidate in reversed(candidates):
+            lowered = candidate.lower()
+            if any(keyword in lowered for keyword in known_keywords):
+                known = _extract_known_category(candidate)
+                if known:
+                    return known
+
+        # If no known category was found, treat as irrelevant for this matrix extraction path.
+        return ''
+
+    def _candidate_size_score(values):
+        score = 0
+        for value in values:
+            token = _safe_text(value)
+            if not token:
+                continue
+            if _canonical_master_size_key(token):
+                score += 2
+            elif _is_size_like_header(token):
+                score += 1
+        return score
+
+    def _infer_header_row_and_reframe(df):
+        """Find a likely header row in the first few rows and rebuild the DataFrame."""
+        if df is None or df.empty:
+            return df, None
+
+        rows = df.astype(str).fillna('').values.tolist()
+        lookahead = min(len(rows), 8)
+        best_idx = None
+        best_score = -1
+
+        for idx in range(lookahead):
+            score = _candidate_size_score(rows[idx])
+            if score > best_score:
+                best_score = score
+                best_idx = idx
+
+        if best_idx is None or best_score < 2 or best_idx >= len(rows) - 1:
+            return df, None
+
+        header_row = [_safe_text(v) for v in rows[best_idx]]
+        data_rows = rows[best_idx + 1:]
+        reframed = pd.DataFrame(data_rows, columns=header_row)
+        return reframed, best_idx
+
+    if raw_html:
+        try:
+            html_tables = pd.read_html(StringIO(str(raw_html)))
+        except Exception as exc:
+            log_body_debug(debug, f"message_id={message_id} body_html_parse_failed error={exc}")
+            html_tables = extract_html_tables_fallback(raw_html)
+            log_body_debug(
+                debug,
+                f"message_id={message_id} body_html_fallback_tables_found={len(html_tables)}"
+            )
+
+        if html_tables:
+            log_body_debug(debug, f"message_id={message_id} body_html_tables_found={len(html_tables)}")
+        else:
+            log_body_debug(debug, f"message_id={message_id} body_html_tables_found=0")
+
+        debug_stats['html_tables_found'] = len(html_tables)
+
+        for table_idx, df in enumerate(html_tables, start=1):
+            if df is None or df.empty:
+                log_body_debug(debug, f"message_id={message_id} body_table_{table_idx} skipped=empty_dataframe")
+                continue
+
+            raw_table_values = df.astype(str).fillna('').values.flatten().tolist()
+
+            working_df = df.copy()
+            working_df.columns = _flatten_columns(working_df.columns)
+            log_body_debug(
+                debug,
+                f"message_id={message_id} body_table_{table_idx} shape={working_df.shape} columns={working_df.columns.tolist()}"
+            )
+            normalized_cols = [_normalize_header(c) for c in working_df.columns]
+            size_cols = [
+                col for col, normalized_col in zip(working_df.columns, normalized_cols)
+                if _is_size_like_header(normalized_col)
+            ]
+
+            # Skip non-item tables.
+            if len(size_cols) < 1:
+                inferred_df, inferred_idx = _infer_header_row_and_reframe(working_df)
+                if inferred_df is not None and inferred_idx is not None:
+                    working_df = inferred_df
+                    working_df.columns = _flatten_columns(working_df.columns)
+                    normalized_cols = [_normalize_header(c) for c in working_df.columns]
+                    size_cols = [
+                        col for col, normalized_col in zip(working_df.columns, normalized_cols)
+                        if _is_size_like_header(normalized_col)
+                    ]
+                    log_body_debug(
+                        debug,
+                        f"message_id={message_id} body_table_{table_idx} header_inferred row_index={inferred_idx} columns={working_df.columns.tolist()} size_cols={size_cols}"
+                    )
+
+            if len(size_cols) < 1:
+                debug_stats['tables_skipped_not_item'] += 1
+                sample_rows = working_df.head(3).astype(str).values.tolist()
+                log_body_debug(
+                    debug,
+                    f"message_id={message_id} body_table_{table_idx} skipped=not_item_table size_cols={size_cols} sample_rows={sample_rows}"
+                )
+                continue
+
+            table_values = raw_table_values + working_df.astype(str).fillna('').values.flatten().tolist()
+            contract_no = _find_contract_no(table_values)
+            po_type = _find_po_type(table_values)
+
+            row_label_col = None
+            for col in working_df.columns:
+                if col in size_cols:
+                    continue
+                candidate_sample = working_df[col].head(5)
+                if isinstance(candidate_sample, pd.DataFrame):
+                    candidate_values = candidate_sample.astype(str).values.flatten().tolist()
+                else:
+                    candidate_values = candidate_sample.astype(str).tolist()
+                candidate_text = ' '.join(_safe_text(v) for v in candidate_values)
+                if re.search(r'[A-Za-z]{3,}', candidate_text):
+                    row_label_col = col
+                    break
+
+            if row_label_col is None:
+                row_label_col = working_df.columns[0]
+
+            non_size_cols = [col for col in working_df.columns if col not in size_cols]
+
+            # Some email tables have a final total column without a proper header.
+            implicit_total_col = None
+            for col in reversed(non_size_cols):
+                if col == row_label_col:
+                    continue
+                col_name = _normalize_header(col)
+                series = working_df[col]
+                if isinstance(series, pd.DataFrame):
+                    values = series.astype(str).values.flatten().tolist()
+                else:
+                    values = series.astype(str).tolist()
+
+                numeric_hits = sum(1 for v in values if _to_float(v) is not None)
+                non_empty = sum(1 for v in values if _safe_text(v))
+                if non_empty == 0:
+                    continue
+
+                # Prefer blank/unnamed headers with mostly numeric values.
+                if (
+                    col_name in {'', 'nan'}
+                    or col_name.startswith('unnamed:')
+                    or col_name in {'total value', 'value'}
+                ) and (numeric_hits / max(non_empty, 1) >= 0.6):
+                    implicit_total_col = col
+                    break
+
+            for _, row in working_df.iterrows():
+                debug_stats['rows_seen'] += 1
+                row_context_text = ' '.join(_extract_scalar_text(row.get(col, '')) for col in non_size_cols).strip()
+                label = _derive_item_category(row, non_size_cols, po_type, contract_no)
+                if not label:
+                    if re.fullmatch(r'\s*7\s*%\s*', row_context_text, flags=re.IGNORECASE):
+                        label = '7%'
+                    elif row_context_text == '':
+                        label = 'Base Qty'
+                    else:
+                        debug_stats['rows_skipped_non_item'] += 1
+                        continue
+                label_lower = label.lower()
+                if not label or label_lower in {'type', 'contract no', 'dir'}:
+                    debug_stats['rows_skipped_empty_or_helper'] += 1
+                    continue
+                if any(token in label_lower for token in ['price ticket', 'cartoon sticker', 'laminating', 'carton stk', 'laminating stk', 'pos', '7%', 'base qty']):
+                    is_known_item = True
+                else:
+                    is_known_item = False
+
+                size_breakdown = {}
+                for col in size_cols:
+                    numeric_val = _to_float(row.get(col, None))
+                    if numeric_val is None:
+                        continue
+                    size_breakdown[_normalize_header(col)] = numeric_val
+
+                if len(size_breakdown) < 1:
+                    debug_stats['rows_skipped_no_numeric_cells'] += 1
+                    continue
+
+                non_total_values = [
+                    value for col_name, value in size_breakdown.items()
+                    if 'total' not in col_name
+                ]
+                total_candidates = [
+                    value for col_name, value in size_breakdown.items()
+                    if 'total' in col_name
+                ]
+
+                explicit_total = total_candidates[0] if total_candidates else None
+                implicit_total_value = _to_float(row.get(implicit_total_col, None)) if implicit_total_col is not None else None
+                total_value = explicit_total if explicit_total is not None else implicit_total_value
+
+                if not is_known_item:
+                    # Filter out helper rows like percentage/tax rows that are not item rows.
+                    if label_lower in {'%', 'first size'}:
+                        debug_stats['rows_skipped_non_item'] += 1
+                        continue
+                    if len(re.findall(r'[A-Za-z]{2,}', label)) == 0:
+                        debug_stats['rows_skipped_non_item'] += 1
+                        continue
+
+                    layoutlmv3_decision = _layoutlmv3_confirms_item_label(label, debug=debug)
+                    if layoutlmv3_decision is False:
+                        debug_stats['rows_skipped_layoutlmv3_reject'] += 1
+                        continue
+
+                product_name = label
+
+                master_row = _empty_master_row()
+                master_row['Type'] = po_type or ''
+                master_row['Contract No'] = contract_no or ''
+                master_row['Item Category'] = label
+
+                for raw_key, raw_value in size_breakdown.items():
+                    canonical_key = _canonical_master_size_key(raw_key)
+                    if canonical_key:
+                        master_row[canonical_key] = raw_value
+
+                if total_value is not None:
+                    master_row['Total'] = total_value
+
+                dedupe_total = total_value if total_value is not None else (round(sum(non_total_values), 4) if non_total_values else 0.0)
+                key = (
+                    product_name.lower(),
+                    contract_no or '',
+                    round(float(dedupe_total), 4),
+                )
+                if key in seen:
+                    debug_stats['rows_skipped_duplicate'] += 1
+                    continue
+                seen.add(key)
+
+                parsed_items.append({
+                    'product_name': product_name,
+                    'quantity': None,
+                    'price': None,
+                    'amount': total_value,
+                    'unit': 'Nos',
+                    'contract_no': contract_no,
+                    'type': po_type,
+                    'item_category': label,
+                    'master_columns': master_row,
+                    'size_breakdown': json.dumps(size_breakdown, ensure_ascii=True),
+                    'source': f'body_table_{table_idx}',
+                })
+                debug_stats['rows_extracted_from_html'] += 1
+
+    log_body_debug(debug, f"message_id={message_id} body_items_after_html_tables={len(parsed_items)}")
 
     dash_pattern = re.compile(
         r'^(?P<name>[A-Za-z][A-Za-z0-9&/\-\s]+?)\s*-\s*(?P<qty>\d[\d,]*)\s*(?P<unit>pcs?|pieces?)\s*-\s*(?:USD\s*)?(?P<rate>\d+(?:\.\d+)?)$',
@@ -330,6 +951,7 @@ def extract_items_from_email_body(text, debug=False, message_id=None):
             'unit': match.group('unit').capitalize(),
             'source': 'body',
         })
+        debug_stats['rows_extracted_from_text'] += 1
 
     log_body_debug(debug, f"message_id={message_id} body_items_extracted={len(parsed_items)}")
 
@@ -360,6 +982,7 @@ def extract_items_from_email_body(text, debug=False, message_id=None):
                 'unit': match.group('unit').capitalize(),
                 'source': 'body',
             })
+            debug_stats['rows_extracted_from_fallback'] += 1
 
         if parsed_items:
             log_body_debug(debug, f"message_id={message_id} body_items_extracted_fallback={len(parsed_items)}")
@@ -374,6 +997,11 @@ def extract_items_from_email_body(text, debug=False, message_id=None):
         log_body_debug(debug, f"message_id={message_id} body_candidate_lines_count={len(candidate_lines)}")
         for idx, line in enumerate(candidate_lines[:20], start=1):
             log_body_debug(debug, f"message_id={message_id} body_candidate_line_{idx}={line}")
+
+    log_body_debug(debug, f"message_id={message_id} body_debug_summary={debug_stats}")
+    if debug and not parsed_items:
+        preview = normalized[:300].replace('\n', ' ')
+        log_body_debug(debug, f"message_id={message_id} body_no_items_extracted plain_text_preview={preview}")
 
     return parsed_items
 
@@ -1088,7 +1716,7 @@ def extract_po_data_from_attachments(access_token, message_id, debug=False):
                 po_data['po_number'] = po_data['po_candidates'][0]
             log_attachment_debug(
                 debug,
-                f"message_id={message_id} processed_attachment name={po_data.get('source_file', '')} status={po_data.get('extraction_status')} po_number={po_data.get('po_number')} po_candidates={po_data.get('po_candidates', [])} text_length={po_data.get('text_length')}"
+                f"message_id={message_id} processed_attachment name={po_data.get('source_file', '')} status={po_data.get('extraction_status')} po_number={po_data.get('po_number')} po_candidates={po_data.get('po_candidates', [])} text_length={po_data.get('text_length')} error={po_data.get('error', '')}"
             )
             results.append(po_data)
         else:
@@ -1160,6 +1788,8 @@ def main():
         st.session_state.emails = []
     if 'classified_emails' not in st.session_state:
         st.session_state.classified_emails = []
+    if 'user_label_overrides' not in st.session_state:
+        st.session_state.user_label_overrides = load_user_label_overrides()
     
     # Auto-capture authorization code from URL (after Microsoft redirect)
     query_params = st.query_params
@@ -1273,9 +1903,9 @@ def main():
             help="Reads supported PDF and image attachments, then uses text extraction and Tesseract OCR to capture PO numbers and related fields."
         )
         debug_attachment_extraction = st.checkbox(
-            "Debug attachment extraction in terminal",
+            "Debug extraction in terminal (attachments + body)",
             value=False,
-            help="Prints attachment listing, byte download, OCR/PDF extraction status, and PO candidates to the terminal."
+            help="Prints attachment/body extraction diagnostics, including table detection and row skip reasons for body parsing."
         )
 
         if extract_from_attachments and not OCR_AVAILABLE and not PDF_AVAILABLE:
@@ -1433,6 +2063,18 @@ def main():
                                 confidence, _ = get_confidence_level(score)
                                 method = f"{method}+ATTACH_EXTRACT"
 
+                            # Apply manual user labels (if available) as final override.
+                            manual_label = st.session_state.user_label_overrides.get(message_id)
+                            if manual_label is not None:
+                                is_po = bool(manual_label)
+                                method = f"{method}+USER_LABEL"
+                                if is_po:
+                                    confidence = 'HIGH'
+                                    icon = '🟢'
+                                else:
+                                    confidence = 'NOT_PO'
+                                    icon = '⚪'
+
                             merged_po_numbers = sorted(set(
                                 extract_po_numbers(f"{subject} {body_text}") + attachment_po_numbers
                             ))
@@ -1443,9 +2085,15 @@ def main():
                                 body_text,
                                 debug=debug_attachment_extraction,
                                 message_id=message_id,
+                                raw_html=body_content,
                             )
                             
                             _, icon = get_confidence_level(score)
+                            if manual_label is not None:
+                                if is_po:
+                                    icon = '🟢'
+                                else:
+                                    icon = '⚪'
                             
                             classified.append({
                                 'id': email.get('id'),
@@ -1469,6 +2117,7 @@ def main():
                                 'supplier_name': supplier_name,
                                 'matched_keywords': keywords,
                                 'matched_patterns': patterns,
+                                'user_label': manual_label,
                             })
                             
                             progress.progress((idx + 1) / len(st.session_state.emails))
@@ -1571,13 +2220,28 @@ def main():
                             st.markdown("**Body Item Extraction:**")
                             body_rows = []
                             for item in email['body_items'][:20]:
+                                master = item.get('master_columns') or _empty_master_row()
                                 body_rows.append({
-                                    'Item Name': item.get('product_name', ''),
-                                    'Quantity': item.get('quantity', ''),
-                                    'Rate': item.get('price', ''),
-                                    'Total Amount': item.get('amount', ''),
+                                    'Type': master.get('Type', item.get('type', '')),
+                                    'Contract No': master.get('Contract No', item.get('contract_no', '')),
+                                    'Item Category': master.get('Item Category', item.get('item_category', item.get('product_name', ''))),
+                                    '5lb': master.get('5lb', None),
+                                    'First Size': master.get('First Size', None),
+                                    'Up To 1Mth': master.get('Up To 1Mth', None),
+                                    'Up To 3Mth': master.get('Up To 3Mth', None),
+                                    '3-6 Mths': master.get('3-6 Mths', None),
+                                    '6-9 Mths': master.get('6-9 Mths', None),
+                                    '9-12 Mths': master.get('9-12 Mths', None),
+                                    '12-18 Mths': master.get('12-18 Mths', None),
+                                    '1.5-2 Yrs': master.get('1.5-2 Yrs', None),
+                                    'Total': master.get('Total', item.get('amount', None)),
+                                    'Source': item.get('source', ''),
                                 })
-                            st.dataframe(pd.DataFrame(body_rows), width='stretch')
+                            body_df = pd.DataFrame(body_rows)
+                            for col in MASTER_NUMERIC_COLUMNS:
+                                if col in body_df.columns:
+                                    body_df[col] = pd.to_numeric(body_df[col], errors='coerce').round().astype('Int64')
+                            st.dataframe(body_df, width='stretch')
 
                         if email.get('attachment_po_data'):
                             st.markdown("**Attachment Extraction:**")
@@ -1607,9 +2271,6 @@ def main():
                                     for item in po['items'][:10]:
                                         item_rows.append({
                                             'Item Name': item.get('product_name') or item.get('description', ''),
-                                            'Quantity': item.get('quantity', ''),
-                                            'Rate': item.get('price', ''),
-                                            'Total Amount': item.get('amount', ''),
                                         })
                                     st.dataframe(pd.DataFrame(item_rows), width='stretch')
                 
@@ -1637,11 +2298,22 @@ def main():
 
                         all_items = []
                         for item in email.get('body_items', []):
+                            master = item.get('master_columns') or _empty_master_row()
                             all_items.append({
                                 'Item Name': str(item.get('product_name') or item.get('description', '')),
-                                'Quantity': str(item.get('quantity', '')),
-                                'Rate': str(item.get('price', '')),
-                                'Total Amount': str(item.get('amount', '')),
+                                'Type': str(master.get('Type', item.get('type', ''))),
+                                'Contract No': str(master.get('Contract No', item.get('contract_no', ''))),
+                                'Item Category': str(master.get('Item Category', item.get('item_category', item.get('product_name', '')))),
+                                '5lb': master.get('5lb'),
+                                'First Size': master.get('First Size'),
+                                'Up To 1Mth': master.get('Up To 1Mth'),
+                                'Up To 3Mth': master.get('Up To 3Mth'),
+                                '3-6 Mths': master.get('3-6 Mths'),
+                                '6-9 Mths': master.get('6-9 Mths'),
+                                '9-12 Mths': master.get('9-12 Mths'),
+                                '12-18 Mths': master.get('12-18 Mths'),
+                                '1.5-2 Yrs': master.get('1.5-2 Yrs'),
+                                'Total': master.get('Total'),
                                 'Item Source': 'Body',
                             })
 
@@ -1649,9 +2321,19 @@ def main():
                             for item in po.get('items', []):
                                 all_items.append({
                                     'Item Name': str(item.get('product_name') or item.get('description', '')),
-                                    'Quantity': str(item.get('quantity', '')),
-                                    'Rate': str(item.get('price', '')),
-                                    'Total Amount': str(item.get('amount', '')),
+                                    'Type': '',
+                                    'Contract No': '',
+                                    'Item Category': '',
+                                    '5lb': '',
+                                    'First Size': '',
+                                    'Up To 1Mth': '',
+                                    'Up To 3Mth': '',
+                                    '3-6 Mths': '',
+                                    '6-9 Mths': '',
+                                    '9-12 Mths': '',
+                                    '12-18 Mths': '',
+                                    '1.5-2 Yrs': '',
+                                    'Total': '',
                                     'Item Source': f"Attachment:{po.get('source_file', 'file')}",
                                 })
 
@@ -1662,13 +2344,26 @@ def main():
                             export_data.append({
                                 **base_row,
                                 'Item Name': '',
-                                'Quantity': '',
-                                'Rate': '',
-                                'Total Amount': '',
+                                'Type': '',
+                                'Contract No': '',
+                                'Item Category': '',
+                                '5lb': '',
+                                'First Size': '',
+                                'Up To 1Mth': '',
+                                'Up To 3Mth': '',
+                                '3-6 Mths': '',
+                                '6-9 Mths': '',
+                                '9-12 Mths': '',
+                                '12-18 Mths': '',
+                                '1.5-2 Yrs': '',
+                                'Total': '',
                                 'Item Source': '',
                             })
                     
                     df = pd.DataFrame(export_data)
+                    for col in MASTER_NUMERIC_COLUMNS:
+                        if col in df.columns:
+                            df[col] = pd.to_numeric(df[col], errors='coerce').round().astype('Int64')
                     csv = df.to_csv(index=False).encode('utf-8-sig')
                     
                     st.download_button(
@@ -1729,12 +2424,30 @@ def main():
                         # Add to training data
                         for email in st.session_state.classified_emails:
                             if 'user_label' in email:
+                                if email.get('id'):
+                                    st.session_state.user_label_overrides[email['id']] = bool(email['user_label'])
+                                email['is_po'] = bool(email['user_label'])
+                                if email['is_po']:
+                                    email['confidence'] = 'HIGH'
+                                    email['icon'] = '🟢'
+                                else:
+                                    email['confidence'] = 'NOT_PO'
+                                    email['icon'] = '⚪'
                                 st.session_state.training_data.append({
                                     'subject': email['subject'],
                                     'body': email['body'],
                                     'is_po': email['user_label']
                                 })
-                        st.success(f"Saved {len(st.session_state.training_data)} labeled examples")
+                        persisted = save_user_label_overrides(st.session_state.user_label_overrides)
+                        if persisted:
+                            st.success(
+                                f"Saved {len(st.session_state.training_data)} labeled examples and "
+                                f"{len(st.session_state.user_label_overrides)} persistent label overrides"
+                            )
+                        else:
+                            st.warning(
+                                "Labels were saved for current session, but writing persistent overrides failed."
+                            )
                 else:
                     st.info("Fetch and classify emails first, then come back here to label them")
                 
